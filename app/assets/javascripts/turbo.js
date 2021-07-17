@@ -63,6 +63,11 @@ class FrameElement extends HTMLElement {
   disconnectedCallback() {
     this.delegate.disconnect();
   }
+  reload() {
+    const {src: src} = this;
+    this.src = null;
+    this.src = src;
+  }
   attributeChangedCallback(name) {
     if (name == "loading") {
       this.delegate.loadingStyleChanged();
@@ -325,6 +330,7 @@ function fetchMethodFromString(method) {
 class FetchRequest {
   constructor(delegate, method, location, body = new URLSearchParams) {
     this.abortController = new AbortController;
+    this.resolveRequestPromise = value => {};
     this.delegate = delegate;
     this.method = method;
     this.headers = this.defaultHeaders;
@@ -351,11 +357,7 @@ class FetchRequest {
     var _a, _b;
     const {fetchOptions: fetchOptions} = this;
     (_b = (_a = this.delegate).prepareHeadersForRequest) === null || _b === void 0 ? void 0 : _b.call(_a, this.headers, this);
-    dispatch("turbo:before-fetch-request", {
-      detail: {
-        fetchOptions: fetchOptions
-      }
-    });
+    await this.allowRequestToBeIntercepted(fetchOptions);
     try {
       this.delegate.requestStarted(this);
       const response = await fetch(this.url.href, fetchOptions);
@@ -404,6 +406,18 @@ class FetchRequest {
   }
   get abortSignal() {
     return this.abortController.signal;
+  }
+  async allowRequestToBeIntercepted(fetchOptions) {
+    const requestInterception = new Promise((resolve => this.resolveRequestPromise = resolve));
+    const event = dispatch("turbo:before-fetch-request", {
+      cancelable: true,
+      detail: {
+        fetchOptions: fetchOptions,
+        url: this.url.href,
+        resume: this.resolveRequestPromise
+      }
+    });
+    if (event.defaultPrevented) await requestInterception;
   }
 }
 
@@ -736,6 +750,7 @@ class FormInterceptor {
 
 class View {
   constructor(delegate, element) {
+    this.resolveRenderPromise = value => {};
     this.delegate = delegate;
     this.element = element;
   }
@@ -768,7 +783,9 @@ class View {
       try {
         this.renderer = renderer;
         this.prepareToRenderSnapshot(renderer);
-        this.delegate.viewWillRenderSnapshot(snapshot, isPreview);
+        const renderInterception = new Promise((resolve => this.resolveRenderPromise = resolve));
+        const immediateRender = this.delegate.allowsImmediateRender(snapshot, this.resolveRenderPromise);
+        if (!immediateRender) await renderInterception;
         await this.renderSnapshot(renderer);
         this.delegate.viewRenderedSnapshot(snapshot, isPreview);
         this.finishRenderingSnapshot(renderer);
@@ -824,7 +841,7 @@ class LinkInterceptor {
         if (this.delegate.shouldInterceptLinkClick(event.target, event.detail.url)) {
           this.clickEvent.preventDefault();
           event.preventDefault();
-          this.convertLinkWithMethodClickToFormSubmission(event.target) || this.delegate.linkClickIntercepted(event.target, event.detail.url);
+          this.delegate.linkClickIntercepted(event.target, event.detail.url);
         }
       }
       delete this.clickEvent;
@@ -844,21 +861,6 @@ class LinkInterceptor {
     this.element.removeEventListener("click", this.clickBubbled);
     document.removeEventListener("turbo:click", this.linkClicked);
     document.removeEventListener("turbo:before-visit", this.willVisit);
-  }
-  convertLinkWithMethodClickToFormSubmission(link) {
-    var _a;
-    const linkMethod = link.getAttribute("data-turbo-method") || link.getAttribute("data-method");
-    if (linkMethod) {
-      const form = document.createElement("form");
-      form.method = linkMethod;
-      form.action = link.getAttribute("href") || "undefined";
-      (_a = link.parentNode) === null || _a === void 0 ? void 0 : _a.insertBefore(form, link);
-      return dispatch("submit", {
-        target: form
-      });
-    } else {
-      return false;
-    }
   }
   respondsToEventTarget(target) {
     const element = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
@@ -1150,7 +1152,7 @@ ProgressBar.animationDuration = 300;
 class HeadSnapshot extends Snapshot {
   constructor() {
     super(...arguments);
-    this.detailsByOuterHTML = this.children.reduce(((result, element) => {
+    this.detailsByOuterHTML = this.children.filter((element => !elementIsNoscript(element))).reduce(((result, element) => {
       const {outerHTML: outerHTML} = element;
       const details = outerHTML in result ? result[outerHTML] : {
         type: elementType(element),
@@ -1215,6 +1217,11 @@ function elementIsTracked(element) {
 function elementIsScript(element) {
   const tagName = element.tagName.toLowerCase();
   return tagName == "script";
+}
+
+function elementIsNoscript(element) {
+  const tagName = element.tagName.toLowerCase();
+  return tagName == "noscript";
 }
 
 function elementIsStylesheet(element) {
@@ -1561,7 +1568,7 @@ class Visit {
     await new Promise((resolve => {
       this.frame = requestAnimationFrame((() => resolve()));
     }));
-    callback();
+    await callback();
     delete this.frame;
     this.performScroll();
   }
@@ -2436,9 +2443,25 @@ class Session {
   }
   followedLinkToLocation(link, location) {
     const action = this.getActionForLink(link);
-    this.visit(location.href, {
+    this.convertLinkWithMethodClickToFormSubmission(link) || this.visit(location.href, {
       action: action
     });
+  }
+  convertLinkWithMethodClickToFormSubmission(link) {
+    var _a;
+    const linkMethod = link.getAttribute("data-turbo-method");
+    if (linkMethod) {
+      const form = document.createElement("form");
+      form.method = linkMethod;
+      form.action = link.getAttribute("href") || "undefined";
+      (_a = link.parentNode) === null || _a === void 0 ? void 0 : _a.insertBefore(form, link);
+      return dispatch("submit", {
+        cancelable: true,
+        target: form
+      });
+    } else {
+      return false;
+    }
   }
   allowsVisitingLocation(location) {
     return this.applicationAllowsVisitingLocation(location);
@@ -2449,7 +2472,7 @@ class Session {
   }
   visitStarted(visit) {
     extendURLWithDeprecatedProperties(visit.location);
-    this.notifyApplicationAfterVisitingLocation(visit.location);
+    this.notifyApplicationAfterVisitingLocation(visit.location, visit.action);
   }
   visitCompleted(visit) {
     this.notifyApplicationAfterPageLoad(visit.getTimingMetrics());
@@ -2476,8 +2499,9 @@ class Session {
   viewWillCacheSnapshot() {
     this.notifyApplicationBeforeCachingSnapshot();
   }
-  viewWillRenderSnapshot({element: element}, isPreview) {
-    this.notifyApplicationBeforeRender(element);
+  allowsImmediateRender({element: element}, resume) {
+    const event = this.notifyApplicationBeforeRender(element, resume);
+    return !event.defaultPrevented;
   }
   viewRenderedSnapshot(snapshot, isPreview) {
     this.view.lastRenderedLocation = this.history.location;
@@ -2511,21 +2535,24 @@ class Session {
       cancelable: true
     });
   }
-  notifyApplicationAfterVisitingLocation(location) {
+  notifyApplicationAfterVisitingLocation(location, action) {
     return dispatch("turbo:visit", {
       detail: {
-        url: location.href
+        url: location.href,
+        action: action
       }
     });
   }
   notifyApplicationBeforeCachingSnapshot() {
     return dispatch("turbo:before-cache");
   }
-  notifyApplicationBeforeRender(newBody) {
+  notifyApplicationBeforeRender(newBody, resume) {
     return dispatch("turbo:before-render", {
       detail: {
-        newBody: newBody
-      }
+        newBody: newBody,
+        resume: resume
+      },
+      cancelable: true
     });
   }
   notifyApplicationAfterRender() {
@@ -2592,7 +2619,10 @@ class FrameController {
       }
       this.linkInterceptor.start();
       this.formInterceptor.start();
-      this.sourceURLChanged();
+      const src = this.element.getAttribute("src");
+      if (window.location.pathname !== src) {
+        this.sourceURLChanged();
+      }
     }
   }
   disconnect() {
@@ -2659,7 +2689,11 @@ class FrameController {
     this.loadSourceURL();
   }
   shouldInterceptLinkClick(element, url) {
-    return this.shouldInterceptNavigation(element);
+    if (element.hasAttribute("data-turbo-method")) {
+      return false;
+    } else {
+      return this.shouldInterceptNavigation(element);
+    }
   }
   linkClickIntercepted(element, url) {
     this.navigateFrame(element, url);
@@ -2722,7 +2756,9 @@ class FrameController {
     const frame = this.findFrameElement(formSubmission.formElement);
     frame.removeAttribute("busy");
   }
-  viewWillRenderSnapshot(snapshot, isPreview) {}
+  allowsImmediateRender(snapshot, resume) {
+    return true;
+  }
   viewRenderedSnapshot(snapshot, isPreview) {}
   viewInvalidated() {}
   async visit(url) {
@@ -2821,14 +2857,20 @@ function activateElement(element, currentURL) {
   if (element) {
     const src = element.getAttribute("src");
     if (src != null && currentURL != null && urlsAreEqual(src, currentURL)) {
-      throw new Error(`Matching <turbo-frame id="${element.id}"> element has a source URL which references itself`);
-    }
-    if (element.ownerDocument !== document) {
-      element = document.importNode(element, true);
-    }
-    if (element instanceof FrameElement) {
-      element.connectedCallback();
-      return element;
+      if (element.ownerDocument !== document) {
+        element = document.importNode(element, true);
+      }
+      if (element instanceof FrameElement) {
+        return element;
+      }
+    } else {
+      if (element.ownerDocument !== document) {
+        element = document.importNode(element, true);
+      }
+      if (element instanceof FrameElement) {
+        element.connectedCallback();
+        return element;
+      }
     }
   }
 }
@@ -2839,6 +2881,9 @@ const StreamActions = {
       var _a;
       return (_a = e.parentElement) === null || _a === void 0 ? void 0 : _a.insertBefore(this.templateContent, e.nextSibling);
     }));
+  },
+  refresh() {
+    this.targetElements.forEach((e => e.reload()));
   },
   append() {
     this.removeDuplicateTargetChildren();
@@ -3036,6 +3081,8 @@ function setProgressBarDelay(delay) {
 var Turbo = Object.freeze({
   __proto__: null,
   navigator: navigator,
+  PageRenderer: PageRenderer,
+  PageSnapshot: PageSnapshot,
   start: start,
   registerAdapter: registerAdapter,
   visit: visit,
@@ -3052,6 +3099,8 @@ start();
 
 var turbo_es2017Esm = Object.freeze({
   __proto__: null,
+  PageRenderer: PageRenderer,
+  PageSnapshot: PageSnapshot,
   clearCache: clearCache,
   connectStreamSource: connectStreamSource,
   disconnectStreamSource: disconnectStreamSource,
